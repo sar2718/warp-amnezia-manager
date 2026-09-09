@@ -1,5 +1,6 @@
-run = "bash warp_generator.sh"
-entrypoint = "warp_generator.sh"
+run = "bash warp_manager.sh"
+entrypoint = "warp_manager.sh"
+
 modules = ["bash"]
 
 hidden = [".config"]
@@ -12,5 +13,5 @@ pattern = "**/*.sh"
 syntax = "bash"
 
 [deployment]
-run = ["bash", "warp_generator.sh"]
+run = ["bash", "warp_manager.sh"]
 deploymentTarget = "cloudrun"
