@@ -15,6 +15,7 @@ else
 fi
 
 CONFIG_DIR="${SCRIPT_DIR}/configs"
+REVOKE_DIR="${SCRIPT_DIR}/revoke"
 DATA_DIR="${SCRIPT_DIR}/.data"
 REGISTRY_FILE="${DATA_DIR}/registrations.json"
 LOCK_FILE="${DATA_DIR}/registrations.lock"
@@ -193,6 +194,15 @@ mask_value() {
     fi
 }
 
+mask_optional_value() {
+    local value="$1"
+    if [[ -z "$value" ]]; then
+        printf '—'
+    else
+        mask_value "$value"
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # Справка
 # -----------------------------------------------------------------------------
@@ -205,19 +215,13 @@ WARP Amnezia Manager
   bash warp_manager.sh
   bash warp_manager.sh --generate [ОПЦИИ] [PRIVATE_KEY [PUBLIC_KEY]]
   bash warp_manager.sh --list
-  bash warp_manager.sh --revoke [НОМЕР|ИМЯ_КОНФИГА|ПУТЬ]
+  bash warp_manager.sh --revoke [НОМЕР|ПУТЬ_К_КОНФИГУ]
+  bash warp_manager.sh --revoke-dir [ДИРЕКТОРИЯ] [--yes]
   bash warp_manager.sh --revoke-id REGISTRATION_ID
   bash warp_manager.sh --revoke-expired [--dry-run]
 
 Без аргументов в интерактивном терминале открывается меню.
 Навигация в меню выполняется цифрами; 0 — назад/отмена/выход.
-
-В мастере пакетной генерации метки можно:
-  - не задавать;
-  - задать одинаковую всем;
-  - автоматически пронумеровать;
-  - задать каждому отдельно;
-  - назначить только выбранным номерам (например 1,3,5-7).
 
 Генерация:
   --generate             Явно перейти в режим генерации.
@@ -228,19 +232,32 @@ WARP Amnezia Manager
   --expires DATE         Дата окончания, например "2026-10-15 18:00".
   -q, --quiet            Не печатать конфиг и vpn:// в терминал.
 
-Управление:
-  В интерактивном меню можно менять метки одной или сразу нескольких регистраций.
+Отзыв и управление:
   --list                 Показать локальный реестр регистраций.
-  --revoke               Интерактивно выбрать регистрацию для отзыва.
-  --revoke TARGET        Отозвать по номеру из --list, имени или пути конфига.
-  --revoke-id ID         Отозвать напрямую по Cloudflare registration ID.
-  --yes                  Не спрашивать подтверждение ручного отзыва.
+  --revoke               Открыть интерактивное меню отзыва.
+  --revoke N             Отозвать регистрацию N из --list.
+  --revoke FILE          Определить регистрацию по содержимому FILE и отозвать её.
+                         Имя и прежний путь файла для поиска не используются.
+  --revoke-dir           Проверить и отозвать подходящие *.conf из ./revoke/.
+  --revoke-dir DIR       То же для указанной директории (только верхний уровень).
+  --revoke-id ID         Отозвать по Cloudflare registration ID из локального реестра.
+  --yes                  Не спрашивать подтверждение отзыва в CLI.
+                         Файлы при этом никогда не удаляются автоматически.
   --revoke-expired       Отозвать все истёкшие активные регистрации.
   --dry-run              С --revoke-expired только показать, что истекло.
 
-Общее:
-  --menu                 Открыть интерактивное меню.
-  -h, --help             Показать справку.
+Как определяется регистрация по .conf:
+  [Interface] PrivateKey -> wg pubkey -> registrations[].public_key
+
+PrivateKey не сохраняется в реестре и не выводится при поиске.
+Если совпадений нет или найдено больше одной записи, отзыв не выполняется.
+
+Директории:
+  configs/                   временно созданные конфиги с PrivateKey
+  revoke/                    временная очередь *.conf для отзыва
+  .data/registrations.json   id/token/public_key и метаданные регистраций
+
+configs/, revoke/ и .data/ должны оставаться в .gitignore.
 
 Примеры:
   bash warp_manager.sh
@@ -248,21 +265,13 @@ WARP Amnezia Manager
   bash warp_manager.sh -n 3 --label "USER" --expires "2026-12-31 23:59"
   bash warp_manager.sh --list
   bash warp_manager.sh --revoke 2
-  bash warp_manager.sh --revoke WARP_1.conf
+  bash warp_manager.sh --revoke ~/Downloads/WARP.conf
+  bash warp_manager.sh --revoke-dir
+  bash warp_manager.sh --revoke-dir ~/Downloads/old-warp
   bash warp_manager.sh --revoke-id <registration-id>
   bash warp_manager.sh --revoke-expired --dry-run
-
-Локальные данные:
-  configs/                   созданные конфиги с PrivateKey
-  .data/registrations.json   id/token и метаданные для управления регистрациями
-
-Обе директории должны оставаться в .gitignore.
 EOF
 }
-
-# -----------------------------------------------------------------------------
-# Зависимости
-# -----------------------------------------------------------------------------
 
 command_package() {
     local manager="$1"
@@ -338,12 +347,23 @@ ensure_dependencies() {
     local missing=()
     local command_name
 
-    if [[ "$mode" == "manage" || "$mode" == "generate" ]]; then
-        required+=(curl)
-    fi
-    if [[ "$mode" == "generate" ]]; then
-        required+=(wg base64)
-    fi
+    case "$mode" in
+        list)
+            ;;
+        manage)
+            required+=(curl)
+            ;;
+        revoke-file)
+            required+=(curl wg)
+            ;;
+        generate)
+            required+=(curl wg base64)
+            ;;
+        *)
+            error "Внутренняя ошибка: неизвестный набор зависимостей '$mode'."
+            return 1
+            ;;
+    esac
 
     for command_name in "${required[@]}"; do
         command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
@@ -382,13 +402,9 @@ ensure_dependencies() {
     done
 }
 
-# -----------------------------------------------------------------------------
-# Реестр регистраций
-# -----------------------------------------------------------------------------
-
 init_registry() {
-    mkdir -p "$CONFIG_DIR" "$DATA_DIR"
-    chmod 700 "$CONFIG_DIR" "$DATA_DIR"
+    mkdir -p "$CONFIG_DIR" "$REVOKE_DIR" "$DATA_DIR"
+    chmod 700 "$CONFIG_DIR" "$REVOKE_DIR" "$DATA_DIR"
 
     if [[ ! -e "$REGISTRY_FILE" ]]; then
         printf '%s\n' '{"version":1,"registrations":[]}' > "$REGISTRY_FILE"
@@ -436,6 +452,13 @@ registry_write_from_jq() {
     mv -f "$tmp_file" "$REGISTRY_FILE"
 }
 
+public_key_registration_count() {
+    local public_key="$1"
+    jq -r --arg public_key "$public_key" '
+        [.registrations[] | select((.public_key // "") == $public_key)] | length
+    ' "$REGISTRY_FILE"
+}
+
 save_registration() {
     local id="$1"
     local token="$2"
@@ -447,43 +470,95 @@ save_registration() {
     registry_lock
     local rc=0
 
-    registry_write_from_jq \
+    # public_key — стабильная связь выданного .conf с регистрацией. Один ключ
+    # не должен одновременно указывать на несколько registration ID.
+    if jq -e \
+        --arg id "$id" \
+        --arg public_key "$public_key" \
+        'any(.registrations[]; ((.public_key // "") == $public_key) and (.id != $id))' \
+        "$REGISTRY_FILE" >/dev/null; then
+        rc=3
+    else
+        registry_write_from_jq \
+            --arg id "$id" \
+            --arg token "$token" \
+            --arg public_key "$public_key" \
+            --arg label "$label" \
+            --arg created_at "$created_at" \
+            --arg expires_at "$expires_at" \
+            '
+            .registrations |=
+                if any(.[]; .id == $id) then
+                    map(
+                        if .id == $id then
+                            .token = $token
+                            | .public_key = $public_key
+                            | .label = $label
+                            | .created_at = $created_at
+                            | .expires_at = (if $expires_at == "" then null else $expires_at end)
+                        else .
+                        end
+                    )
+                else
+                    . + [{
+                        id: $id,
+                        token: $token,
+                        public_key: $public_key,
+                        config: null,
+                        label: $label,
+                        created_at: $created_at,
+                        expires_at: (if $expires_at == "" then null else $expires_at end),
+                        revoked_at: null,
+                        revoke_reason: null
+                    }]
+                end
+            ' || rc=$?
+    fi
+
+    registry_unlock
+    return "$rc"
+}
+
+save_emergency_registration_recovery() {
+    local id="$1"
+    local token="$2"
+    local public_key="$3"
+    local label="$4"
+    local created_at="$5"
+    local expires_at="$6"
+
+    local stamp safe_id recovery_file
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    safe_id="${id//[^A-Za-z0-9._-]/_}"
+    [[ -n "$safe_id" ]] || safe_id="unknown"
+
+    recovery_file="$(mktemp "${DATA_DIR}/recovery-${stamp}-${safe_id}.XXXXXX.json" 2>/dev/null)" || return 1
+    chmod 600 "$recovery_file" 2>/dev/null || {
+        rm -f -- "$recovery_file"
+        return 1
+    }
+
+    if ! jq -n \
         --arg id "$id" \
         --arg token "$token" \
         --arg public_key "$public_key" \
         --arg label "$label" \
         --arg created_at "$created_at" \
         --arg expires_at "$expires_at" \
-        '
-        .registrations |=
-            if any(.[]; .id == $id) then
-                map(
-                    if .id == $id then
-                        .token = $token
-                        | .public_key = $public_key
-                        | .label = $label
-                        | .created_at = $created_at
-                        | .expires_at = (if $expires_at == "" then null else $expires_at end)
-                    else .
-                    end
-                )
-            else
-                . + [{
-                    id: $id,
-                    token: $token,
-                    public_key: $public_key,
-                    config: null,
-                    label: $label,
-                    created_at: $created_at,
-                    expires_at: (if $expires_at == "" then null else $expires_at end),
-                    revoked_at: null,
-                    revoke_reason: null
-                }]
-            end
-        ' || rc=$?
+        '{
+            reason: "registry-save-and-rollback-failed",
+            id: $id,
+            token: $token,
+            public_key: $public_key,
+            label: $label,
+            created_at: $created_at,
+            expires_at: (if $expires_at == "" then null else $expires_at end)
+        }' > "$recovery_file"; then
+        rm -f -- "$recovery_file"
+        return 1
+    fi
 
-    registry_unlock
-    return "$rc"
+    printf '%s' "$recovery_file"
 }
 
 update_registration_config() {
@@ -581,52 +656,153 @@ get_registration_by_id() {
     ' "$REGISTRY_FILE"
 }
 
-find_registration_by_config() {
-    local target="$1"
-    local target_base
-    target_base="$(basename -- "$target")"
+normalize_input_path() {
+    local path="$1"
 
-    local matches
+    # В интерактивном вводе пользователь иногда вставляет путь вместе с кавычками.
+    if [[ ${#path} -ge 2 ]]; then
+        if [[ "${path:0:1}" == '"' && "${path: -1}" == '"' ]]; then
+            path="${path:1:${#path}-2}"
+        elif [[ "${path:0:1}" == "'" && "${path: -1}" == "'" ]]; then
+            path="${path:1:${#path}-2}"
+        fi
+    fi
+
+    case "$path" in
+        '~')
+            printf '%s' "$HOME"
+            ;;
+        '~/'*)
+            printf '%s/%s' "$HOME" "${path#\~/}"
+            ;;
+        *)
+            printf '%s' "$path"
+            ;;
+    esac
+}
+
+trim_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+# Коды возврата:
+#   10 — путь не является обычным файлом;
+#   11 — файл нельзя прочитать;
+#   12 — PrivateKey в [Interface] не найден;
+#   13 — найдено несколько PrivateKey в [Interface].
+extract_interface_private_key() {
+    local file="$1"
+
+    [[ -f "$file" ]] || return 10
+    [[ -r "$file" ]] || return 11
+
+    local section=""
+    local private_key=""
+    local count=0
+    local line value
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        line="${line#$'\xEF\xBB\xBF'}"
+        line="$(trim_whitespace "$line")"
+
+        [[ -z "$line" ]] && continue
+        [[ "$line" == \#* || "$line" == \;* ]] && continue
+
+        if [[ "$line" =~ ^\[([^][]+)\][[:space:]]*$ ]]; then
+            section="${BASH_REMATCH[1],,}"
+            continue
+        fi
+
+        [[ "$section" == "interface" ]] || continue
+
+        if [[ "$line" =~ ^PrivateKey[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            value="${BASH_REMATCH[1]}"
+            value="${value%%#*}"
+            value="${value%%;*}"
+            value="$(trim_whitespace "$value")"
+            count=$((count + 1))
+            private_key="$value"
+        fi
+    done < "$file"
+
+    (( count > 0 )) || return 12
+    (( count == 1 )) || return 13
+    [[ -n "$private_key" ]] || return 12
+
+    printf '%s' "$private_key"
+}
+
+# Код 14 означает, что найденный PrivateKey не принят wg pubkey.
+public_key_from_config_file() {
+    local file="$1"
+    local private_key public_key rc
+
+    private_key="$(extract_interface_private_key "$file")" || {
+        rc=$?
+        return "$rc"
+    }
+
+    public_key="$(printf '%s\n' "$private_key" | wg pubkey 2>/dev/null)" || {
+        unset private_key
+        return 14
+    }
+    unset private_key
+
+    public_key="${public_key//$'\r'/}"
+    public_key="${public_key//$'\n'/}"
+    [[ -n "$public_key" ]] || return 14
+
+    printf '%s' "$public_key"
+}
+
+find_registration_by_public_key() {
+    local public_key="$1"
+    local matches count
+
     matches="$(
-        jq -c \
-            --arg target "$target" \
-            --arg base "$target_base" \
-            '
-            [
-                .registrations[]
-                | select(
-                    (.config // "") == $target
-                    or ((.config // "") | split("/")[-1]) == $base
-                )
-            ]
-            ' "$REGISTRY_FILE"
-    )"
+        jq -c --arg public_key "$public_key" '
+            [.registrations[] | select((.public_key // "") == $public_key)]
+        ' "$REGISTRY_FILE"
+    )" || return 22
 
-    local count
-    count="$(jq 'length' <<< "$matches")"
+    count="$(jq -r 'length' <<< "$matches")" || return 22
 
     if [[ "$count" -eq 0 ]]; then
-        return 1
+        return 20
     fi
     if [[ "$count" -gt 1 ]]; then
-        return 2
+        return 21
     fi
 
     jq -c '.[0]' <<< "$matches"
 }
 
-resolve_registration_target() {
-    local target="$1"
+# Определяет регистрацию исключительно по содержимому .conf.
+# Имя файла, basename и сохранённое поле .config намеренно не используются.
+config_lookup_error_text() {
+    case "$1" in
+        10) printf 'путь не является обычным файлом' ;;
+        11) printf 'нет прав на чтение файла' ;;
+        12) printf 'в секции [Interface] не найден PrivateKey' ;;
+        13) printf 'в секции [Interface] найдено несколько PrivateKey' ;;
+        14) printf 'PrivateKey имеет некорректный формат' ;;
+        20) printf 'соответствующая регистрация не найдена в локальном реестре' ;;
+        21) printf 'одному public_key соответствует несколько записей реестра' ;;
+        22) printf 'не удалось прочитать локальный реестр' ;;
+        *) printf 'неизвестная ошибка сопоставления' ;;
+    esac
+}
 
-    if [[ "$target" =~ ^[0-9]+$ ]]; then
-        local by_index
-        by_index="$(get_registration_by_index "$target")"
-        [[ -n "$by_index" ]] || return 1
-        printf '%s' "$by_index"
-        return 0
-    fi
-
-    find_registration_by_config "$target"
+registration_index_by_id() {
+    local id="$1"
+    jq -r --arg id "$id" '
+        (.registrations | map(.id) | index($id)) as $i
+        | if $i == null then empty else ($i + 1) end
+    ' "$REGISTRY_FILE"
 }
 
 registration_status() {
@@ -699,19 +875,27 @@ format_date_local() {
     fi
 }
 
+short_registration_id() {
+    local id="$1"
+    if [[ -z "$id" ]]; then
+        printf 'без id'
+    elif (( ${#id} <= 12 )); then
+        printf '%s' "$id"
+    else
+        printf '%s…%s' "${id:0:8}" "${id: -4}"
+    fi
+}
+
 display_name_for_registration() {
     local registration="$1"
-    local label config id
+    local label id
     label="$(jq -r '.label // empty' <<< "$registration")"
-    config="$(jq -r '.config // empty' <<< "$registration")"
     id="$(jq -r '.id // empty' <<< "$registration")"
 
     if [[ -n "$label" ]]; then
         printf '%s' "$label"
-    elif [[ -n "$config" ]]; then
-        basename -- "$config"
     else
-        printf '%s' "$id"
+        printf 'Регистрация %s' "$(short_registration_id "$id")"
     fi
 }
 
@@ -1045,10 +1229,40 @@ generate_configs() {
             private_key="$(wg genkey | tr -d '\n')"
         fi
 
+        local derived_public_key
+        if ! derived_public_key="$(printf '%s\n' "$private_key" | wg pubkey 2>/dev/null | tr -d '\r\n')"; then
+            error "Не удалось получить public key: PrivateKey имеет некорректный формат."
+            print_partial_result
+            return 1
+        fi
+        if [[ -z "$derived_public_key" ]]; then
+            error "wg pubkey вернул пустой public key."
+            print_partial_result
+            return 1
+        fi
+
         if [[ "$i" -eq 1 && -n "$supplied_public_key" ]]; then
+            if [[ "$supplied_public_key" != "$derived_public_key" ]]; then
+                error "Переданный PUBLIC_KEY не соответствует PRIVATE_KEY."
+                print_partial_result
+                return 1
+            fi
             public_key="$supplied_public_key"
         else
-            public_key="$(printf '%s' "$private_key" | wg pubkey | tr -d '\n')"
+            public_key="$derived_public_key"
+        fi
+
+        local existing_key_count
+        if ! existing_key_count="$(public_key_registration_count "$public_key")"; then
+            error "Не удалось проверить уникальность client public key в registrations.json."
+            print_partial_result
+            return 1
+        fi
+        if (( existing_key_count > 0 )); then
+            error "Этот client public key уже присутствует в registrations.json."
+            error "Повторно использовать одну пару ключей для новой регистрации нельзя."
+            print_partial_result
+            return 1
         fi
 
         local created_at expires_at label
@@ -1119,16 +1333,33 @@ generate_configs() {
 
         # Сохраняем id/token сразу. Если следующий этап завершится ошибкой,
         # регистрацией всё равно можно будет управлять и отозвать её через локальный реестр.
-        if ! save_registration "$id" "$token" "$public_key" "$label" "$created_at" "$expires_at"; then
-            error "Регистрация создана, но управляющие данные не удалось сохранить."
-            warn "Пытаюсь немедленно отозвать регистрацию, чтобы не оставить её без управления."
+        local save_rc=0
+        save_registration "$id" "$token" "$public_key" "$label" "$created_at" "$expires_at" || save_rc=$?
+        if (( save_rc != 0 )); then
+            if (( save_rc == 3 )); then
+                error "Регистрация создана, но этот client public key уже появился в локальном реестре."
+                error "Обнаружена параллельная операция или конфликт ключей."
+            else
+                error "Регистрация создана, но управляющие данные не удалось сохранить."
+            fi
+            warn "Пытаюсь немедленно отозвать новую регистрацию, чтобы не оставить её без управления."
 
             if revoke_api_registration "$id" "$token"; then
-                error "Регистрация была удалена с сервера. Генерация остановлена безопасно."
+                error "Новая регистрация удалена с сервера. Генерация остановлена безопасно."
             else
                 error "ВАЖНО: автоматический откат тоже не удался."
-                error "Сохраните вручную id=${id}"
-                error "Сохраните вручную token=${token}"
+                local recovery_file=""
+                if recovery_file="$(save_emergency_registration_recovery \
+                    "$id" "$token" "$public_key" "$label" "$created_at" "$expires_at")"; then
+                    error "Управляющие данные сохранены в аварийный файл с правами 600:"
+                    error "$recovery_file"
+                    error "Не удаляйте этот файл, пока регистрация не будет отозвана или возвращена в реестр."
+                else
+                    error "Не удалось сохранить даже аварийный recovery-файл."
+                    error "Registration ID: ${id}"
+                    error "Management token: ${token}"
+                    error "Скопируйте эти две строки в безопасное место: без token регистрацию нельзя будет отозвать этим менеджером."
+                fi
             fi
             return 1
         fi
@@ -1232,33 +1463,21 @@ print_registration_list() {
         return 0
     fi
 
-    local index=0 registration status label config expires file_state
+    local index=0 registration status label expires public_key
     while IFS= read -r registration; do
         index=$((index + 1))
         status="$(registration_status "$registration")"
         label="$(jq -r '.label // empty' <<< "$registration")"
-        config="$(jq -r '.config // empty' <<< "$registration")"
         expires="$(jq -r '.expires_at // empty' <<< "$registration")"
+        public_key="$(jq -r '.public_key // empty' <<< "$registration")"
 
         [[ -n "$label" ]] || label="${C_DIM}(без метки)${C_RESET}"
 
-        if [[ -n "$config" ]]; then
-            if [[ -e "${SCRIPT_DIR}/${config}" ]]; then
-                file_state="есть"
-            else
-                file_state="нет"
-            fi
-            config="$(basename -- "$config")"
-        else
-            config="—"
-            file_state="—"
-        fi
-
         printf '  %s[%s]%s %s\n' "$C_CYAN" "$index" "$C_RESET" "$label"
-        printf '      Конфиг: %s  ·  Истекает: %s  ·  Статус: ' \
-            "$config" "$(format_date_local "$expires")"
+        printf '      Public key: %s  ·  Истекает: %s  ·  Статус: ' \
+            "$(mask_optional_value "$public_key")" "$(format_date_local "$expires")"
         status_display "$status"
-        printf '  ·  Файл: %s\n' "$file_state"
+        printf '\n'
 
         if (( index < total )); then
             printf '      %s────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
@@ -1268,17 +1487,18 @@ print_registration_list() {
 
 confirm_revoke() {
     local registration="$1"
-    local name status expires config raw_label
+    local status expires raw_label public_key created
 
-    name="$(display_name_for_registration "$registration")"
     raw_label="$(jq -r '.label // empty' <<< "$registration")"
     status="$(registration_status "$registration")"
     expires="$(jq -r '.expires_at // empty' <<< "$registration")"
-    config="$(jq -r '.config // empty' <<< "$registration")"
+    created="$(jq -r '.created_at // empty' <<< "$registration")"
+    public_key="$(jq -r '.public_key // empty' <<< "$registration")"
 
-    printf '\n%sРегистрация:%s\n' "$C_BOLD" "$C_RESET"
+    printf '\n%sНайдена регистрация:%s\n' "$C_BOLD" "$C_RESET"
     print_field "Метка" "${raw_label:-—}"
-    print_field "Конфиг" "${config:-—}"
+    print_field "Public key" "$(mask_optional_value "$public_key")"
+    print_field "Создана" "$(format_date_local "$created")"
     print_field "Истекает" "$(format_date_local "$expires")"
     print_field_prefix "Статус"
     status_display "$status"
@@ -1295,7 +1515,7 @@ confirm_revoke() {
 
     while true; do
         printf '\n'
-        print_danger_item "1" "Отозвать регистрацию"
+        print_danger_item "1" "Отозвать эту регистрацию"
         print_menu_item "0" "Отмена"
         local answer
         read_menu_choice answer
@@ -1355,9 +1575,9 @@ revoke_registration_record() {
     info "Локальный конфиг не удалялся."
 }
 
-interactive_revoke() {
+interactive_revoke_by_index() {
     [[ -t 0 ]] || {
-        error "--revoke без аргумента требует интерактивный терминал."
+        error "Интерактивный отзыв требует терминал."
         return 1
     }
 
@@ -1388,28 +1608,576 @@ interactive_revoke() {
     revoke_registration_record "$registration" manual 1
 }
 
-revoke_target() {
-    local target="$1"
+report_config_lookup_error() {
+    local file="$1"
+    local rc="$2"
+    error "Не удалось определить регистрацию по файлу: $file"
+    error "Причина: $(config_lookup_error_text "$rc")."
+}
 
-    ensure_dependencies manage || return 1
+offer_delete_queue_file() {
+    local file="$1"
+    local expected_public_key="$2"
+
+    [[ -t 0 ]] || return 0
+
+    printf '\n'
+    print_danger_item "1" "Удалить этот файл из revoke/"
+    print_menu_item "0" "Оставить файл"
+
+    local answer
+    while true; do
+        read_menu_choice answer
+        case "$answer" in
+            1)
+                local current_public_key rc
+                current_public_key="$(public_key_from_config_file "$file")" || {
+                    rc=$?
+                    warn "Файл изменился или больше не читается; удаление отменено ($(config_lookup_error_text "$rc"))."
+                    return 0
+                }
+                if [[ "$current_public_key" != "$expected_public_key" ]]; then
+                    warn "Содержимое файла изменилось после проверки; удаление отменено."
+                    return 0
+                fi
+                rm -- "$file"
+                ok "Файл удалён из revoke/: $(basename -- "$file")"
+                return 0
+                ;;
+            0)
+                info "Файл оставлен в revoke/."
+                return 0
+                ;;
+            *)
+                warn "Выберите 1 или 0."
+                ;;
+        esac
+    done
+}
+
+revoke_config_file() {
+    local input_path="$1"
+    local queue_cleanup="${2:-0}"
+
+    ensure_dependencies revoke-file || return 1
     init_registry || return 1
 
-    local registration rc
-    set +e
-    registration="$(resolve_registration_target "$target")"
-    rc=$?
-    set -e
+    local file
+    file="$(normalize_input_path "$input_path")"
 
-    if [[ "$rc" -ne 0 ]]; then
-        if [[ "$rc" -eq 2 ]]; then
-            error "Найдено несколько конфигов с именем '$target'. Используйте номер из --list."
-        else
-            error "Регистрация '$target' не найдена."
+    local public_key registration rc
+    public_key="$(public_key_from_config_file "$file")" || {
+        rc=$?
+        report_config_lookup_error "$file" "$rc"
+        return 1
+    }
+
+    registration="$(find_registration_by_public_key "$public_key")" || {
+        rc=$?
+        report_config_lookup_error "$file" "$rc"
+        return 1
+    }
+
+    local revoked_at id index
+    revoked_at="$(jq -r '.revoked_at // empty' <<< "$registration")"
+    id="$(jq -r '.id // empty' <<< "$registration")"
+    index="$(registration_index_by_id "$id")"
+
+    printf '\n%sФайл:%s %s\n' "$C_BOLD" "$C_RESET" "$file"
+    [[ -n "$index" ]] && printf '  Запись реестра:           #%s\n' "$index"
+
+    if [[ -n "$revoked_at" ]]; then
+        info "Эта регистрация уже отозвана ($(format_date_local "$revoked_at"))."
+        if (( queue_cleanup == 1 )); then
+            offer_delete_queue_file "$file" "$public_key"
         fi
+        return 0
+    fi
+
+    if ! revoke_registration_record "$registration" manual 1; then
         return 1
     fi
 
-    revoke_registration_record "$registration" manual 1
+    # При отмене revoke_registration_record возвращает 0, поэтому перед удалением
+    # подтверждаем, что запись действительно получила revoked_at.
+    registration="$(get_registration_by_id "$id")"
+    revoked_at="$(jq -r '.revoked_at // empty' <<< "$registration")"
+    if [[ -n "$revoked_at" && "$queue_cleanup" -eq 1 ]]; then
+        offer_delete_queue_file "$file" "$public_key"
+    fi
+}
+
+REVOKE_SCAN_FILES=()
+REVOKE_SCAN_STATUSES=()
+REVOKE_SCAN_DETAILS=()
+REVOKE_SCAN_PUBLIC_KEYS=()
+
+scan_revoke_directory() {
+    local input_dir="$1"
+    local directory
+    directory="$(normalize_input_path "$input_dir")"
+
+    [[ -d "$directory" ]] || {
+        error "Директория не найдена: $directory"
+        return 1
+    }
+    [[ -r "$directory" && -x "$directory" ]] || {
+        error "Нет доступа к директории: $directory"
+        return 1
+    }
+
+    REVOKE_SCAN_FILES=()
+    REVOKE_SCAN_STATUSES=()
+    REVOKE_SCAN_DETAILS=()
+    REVOKE_SCAN_PUBLIC_KEYS=()
+
+    local nullglob_was=0 nocaseglob_was=0 dotglob_was=0
+    shopt -q nullglob && nullglob_was=1
+    shopt -q nocaseglob && nocaseglob_was=1
+    shopt -q dotglob && dotglob_was=1
+    shopt -s nullglob nocaseglob dotglob
+    local candidates=("$directory"/*.conf)
+    (( nullglob_was == 1 )) || shopt -u nullglob
+    (( nocaseglob_was == 1 )) || shopt -u nocaseglob
+    (( dotglob_was == 1 )) || shopt -u dotglob
+
+    local -A seen=()
+    local file public_key registration rc status detail primary revoked_at name
+
+    for file in "${candidates[@]}"; do
+        [[ -f "$file" ]] || continue
+
+        REVOKE_SCAN_FILES+=("$file")
+        public_key=""
+        registration=""
+        primary=""
+
+        public_key="$(public_key_from_config_file "$file")" || {
+            rc=$?
+            REVOKE_SCAN_STATUSES+=("invalid")
+            REVOKE_SCAN_DETAILS+=("$(config_lookup_error_text "$rc")")
+            REVOKE_SCAN_PUBLIC_KEYS+=("")
+            continue
+        }
+
+        if [[ -n "${seen[$public_key]:-}" ]]; then
+            primary="${seen[$public_key]}"
+            REVOKE_SCAN_STATUSES+=("duplicate")
+            REVOKE_SCAN_DETAILS+=("дубликат файла #${primary}")
+            REVOKE_SCAN_PUBLIC_KEYS+=("$public_key")
+            continue
+        fi
+        seen["$public_key"]="${#REVOKE_SCAN_FILES[@]}"
+
+        registration="$(find_registration_by_public_key "$public_key")" || {
+            rc=$?
+            if [[ "$rc" -eq 20 ]]; then
+                status="unknown"
+                detail="регистрация не найдена в реестре"
+            elif [[ "$rc" -eq 21 ]]; then
+                status="conflict"
+                detail="конфликт: public_key встречается в реестре несколько раз"
+            else
+                status="invalid"
+                detail="$(config_lookup_error_text "$rc")"
+            fi
+            REVOKE_SCAN_STATUSES+=("$status")
+            REVOKE_SCAN_DETAILS+=("$detail")
+            REVOKE_SCAN_PUBLIC_KEYS+=("$public_key")
+            continue
+        }
+
+        revoked_at="$(jq -r '.revoked_at // empty' <<< "$registration")"
+        name="$(display_name_for_registration "$registration")"
+        if [[ -n "$revoked_at" ]]; then
+            status="revoked"
+            detail="${name} — уже отозвана"
+        else
+            status="ready"
+            detail="$name"
+        fi
+
+        REVOKE_SCAN_STATUSES+=("$status")
+        REVOKE_SCAN_DETAILS+=("$detail")
+        REVOKE_SCAN_PUBLIC_KEYS+=("$public_key")
+    done
+}
+
+revoke_scan_status_text() {
+    case "$1" in
+        ready) printf 'ГОТОВ К ОТЗЫВУ' ;;
+        revoked) printf 'УЖЕ ОТОЗВАН' ;;
+        unknown) printf 'НЕ НАЙДЕН В РЕЕСТРЕ' ;;
+        invalid) printf 'НЕКОРРЕКТНЫЙ КОНФИГ' ;;
+        duplicate) printf 'ДУБЛИКАТ' ;;
+        conflict) printf 'КОНФЛИКТ РЕЕСТРА' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+revoke_scan_status_display() {
+    local status="$1"
+    local text padded
+    text="$(revoke_scan_status_text "$status")"
+    printf -v padded '%-24s' "$text"
+
+    case "$status" in
+        ready) printf '%s%s%s' "$C_GREEN" "$padded" "$C_RESET" ;;
+        revoked|duplicate) printf '%s%s%s' "$C_DIM" "$padded" "$C_RESET" ;;
+        unknown) printf '%s%s%s' "$C_YELLOW" "$padded" "$C_RESET" ;;
+        invalid|conflict) printf '%s%s%s' "$C_RED" "$padded" "$C_RESET" ;;
+        *) printf '%s' "$padded" ;;
+    esac
+}
+
+print_revoke_scan() {
+    local i status
+
+    if (( ${#REVOKE_SCAN_FILES[@]} == 0 )); then
+        printf '  Подходящих *.conf не найдено.\n'
+        return 0
+    fi
+
+    for ((i = 0; i < ${#REVOKE_SCAN_FILES[@]}; i++)); do
+        status="${REVOKE_SCAN_STATUSES[$i]}"
+        printf '  %s[%d]%s %s\n' "$C_CYAN" "$((i + 1))" "$C_RESET" \
+            "$(basename -- "${REVOKE_SCAN_FILES[$i]}")"
+        printf '      '
+        revoke_scan_status_display "$status"
+        printf ' · %s\n' "${REVOKE_SCAN_DETAILS[$i]}"
+    done
+}
+
+queue_config_count() {
+    ensure_dependencies list >/dev/null 2>&1 || return 1
+    init_registry >/dev/null 2>&1 || return 1
+
+    local nullglob_was=0 nocaseglob_was=0 dotglob_was=0
+    shopt -q nullglob && nullglob_was=1
+    shopt -q nocaseglob && nocaseglob_was=1
+    shopt -q dotglob && dotglob_was=1
+    shopt -s nullglob nocaseglob dotglob
+    local files=("$REVOKE_DIR"/*.conf)
+    (( nullglob_was == 1 )) || shopt -u nullglob
+    (( nocaseglob_was == 1 )) || shopt -u nocaseglob
+    (( dotglob_was == 1 )) || shopt -u dotglob
+
+    local count=0 file
+    for file in "${files[@]}"; do
+        [[ -f "$file" ]] && count=$((count + 1))
+    done
+    printf '%s' "$count"
+}
+
+interactive_revoke_queue_file() {
+    ensure_dependencies revoke-file || return 1
+    init_registry || return 1
+    scan_revoke_directory "$REVOKE_DIR" || return 1
+
+    if (( ${#REVOKE_SCAN_FILES[@]} == 0 )); then
+        info "В revoke/ нет *.conf для обработки."
+        return 0
+    fi
+
+    print_revoke_scan
+
+    local choice
+    while true; do
+        printf '\nНомер файла [0 — назад]: '
+        read -r choice
+        [[ -n "$choice" ]] || continue
+        [[ "$choice" == "0" ]] && return 0
+        if [[ ! "$choice" =~ ^[1-9][0-9]*$ ]] || (( choice > ${#REVOKE_SCAN_FILES[@]} )); then
+            warn "Введите номер файла из списка или 0."
+            continue
+        fi
+        break
+    done
+
+    revoke_config_file "${REVOKE_SCAN_FILES[$((choice - 1))]}" 1
+}
+
+interactive_revoke_path() {
+    ensure_dependencies revoke-file || return 1
+    init_registry || return 1
+
+    local path
+    printf 'Путь к .conf [0 — назад]: '
+    IFS= read -r path
+    [[ -n "$path" ]] || return 0
+    [[ "$path" == "0" ]] && return 0
+
+    revoke_config_file "$path" 0
+}
+
+confirm_batch_revoke() {
+    local ready_count="$1"
+
+    if [[ "${YES:-0}" -eq 1 ]]; then
+        return 0
+    fi
+
+    [[ -t 0 ]] || {
+        error "Для неинтерактивного массового отзыва добавьте --yes."
+        return 1
+    }
+
+    printf '\n'
+    print_danger_item "1" "Подтвердить массовый отзыв (${ready_count})"
+    print_menu_item "0" "Отмена"
+
+    local answer
+    while true; do
+        read_menu_choice answer
+        case "$answer" in
+            1) return 0 ;;
+            0) return 1 ;;
+            *) warn "Выберите 1 или 0." ;;
+        esac
+    done
+}
+
+remove_batch_queue_files() {
+    local -n files_ref="$1"
+    local -n keys_ref="$2"
+    local removed=0 kept=0 i current_public_key rc
+
+    for ((i = 0; i < ${#files_ref[@]}; i++)); do
+        current_public_key="$(public_key_from_config_file "${files_ref[$i]}")" || {
+            rc=$?
+            warn "Не удаляю $(basename -- "${files_ref[$i]}"): файл изменён или не читается ($(config_lookup_error_text "$rc"))."
+            kept=$((kept + 1))
+            continue
+        }
+        if [[ "$current_public_key" != "${keys_ref[$i]}" ]]; then
+            warn "Не удаляю $(basename -- "${files_ref[$i]}"): содержимое изменилось после отзыва."
+            kept=$((kept + 1))
+            continue
+        fi
+        if rm -- "${files_ref[$i]}"; then
+            removed=$((removed + 1))
+        else
+            warn "Не удалось удалить: ${files_ref[$i]}"
+            kept=$((kept + 1))
+        fi
+    done
+
+    ok "Удалено из revoke/: ${removed}. Оставлено: ${kept}."
+}
+
+revoke_directory() {
+    local input_dir="$1"
+    local allow_queue_cleanup="${2:-0}"
+
+    ensure_dependencies revoke-file || return 1
+    init_registry || return 1
+
+    local directory
+    directory="$(normalize_input_path "$input_dir")"
+    scan_revoke_directory "$directory" || return 1
+
+    printf '\n%sПроверка директории:%s %s\n\n' "$C_BOLD" "$C_RESET" "$directory"
+    print_revoke_scan
+
+    local ready=0 already=0 unknown=0 invalid=0 duplicate=0 conflict=0 i
+    for ((i = 0; i < ${#REVOKE_SCAN_FILES[@]}; i++)); do
+        case "${REVOKE_SCAN_STATUSES[$i]}" in
+            ready) ready=$((ready + 1)) ;;
+            revoked) already=$((already + 1)) ;;
+            unknown) unknown=$((unknown + 1)) ;;
+            invalid) invalid=$((invalid + 1)) ;;
+            duplicate) duplicate=$((duplicate + 1)) ;;
+            conflict) conflict=$((conflict + 1)) ;;
+        esac
+    done
+
+    printf '\n%sСводка проверки:%s\n' "$C_BOLD" "$C_RESET"
+    print_field "Готовы к отзыву" "$ready"
+    print_field "Уже отозваны" "$already"
+    print_field "Не найдены" "$unknown"
+    print_field "Некорректные" "$invalid"
+    print_field "Дубликаты" "$duplicate"
+    print_field "Конфликты реестра" "$conflict"
+
+    if (( ready == 0 )); then
+        info "Нет регистраций, готовых к отзыву. Никаких API-запросов не выполнено."
+        if (( unknown > 0 || invalid > 0 || conflict > 0 )); then
+            return 1
+        fi
+        return 0
+    fi
+
+    if ! confirm_batch_revoke "$ready"; then
+        info "Массовый отзыв отменён."
+        return 0
+    fi
+
+    local success=0 failed=0 changed=0 skipped=$((already + unknown + invalid + duplicate + conflict))
+    local file expected_key current_key registration rc revoked_at
+    local successful_files=()
+    local successful_keys=()
+
+    for ((i = 0; i < ${#REVOKE_SCAN_FILES[@]}; i++)); do
+        [[ "${REVOKE_SCAN_STATUSES[$i]}" == "ready" ]] || continue
+
+        file="${REVOKE_SCAN_FILES[$i]}"
+        expected_key="${REVOKE_SCAN_PUBLIC_KEYS[$i]}"
+
+        current_key="$(public_key_from_config_file "$file")" || {
+            rc=$?
+            error "$(basename -- "$file"): файл изменился после проверки ($(config_lookup_error_text "$rc"))."
+            failed=$((failed + 1))
+            changed=$((changed + 1))
+            continue
+        }
+        if [[ "$current_key" != "$expected_key" ]]; then
+            error "$(basename -- "$file"): содержимое изменилось после проверки; пропускаю."
+            failed=$((failed + 1))
+            changed=$((changed + 1))
+            continue
+        fi
+
+        registration="$(find_registration_by_public_key "$expected_key")" || {
+            rc=$?
+            error "$(basename -- "$file"): состояние реестра изменилось ($(config_lookup_error_text "$rc"))."
+            failed=$((failed + 1))
+            continue
+        }
+
+        revoked_at="$(jq -r '.revoked_at // empty' <<< "$registration")"
+        if [[ -n "$revoked_at" ]]; then
+            info "$(display_name_for_registration "$registration"): уже отозвана; пропускаю."
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        if revoke_registration_record "$registration" manual-batch 0; then
+            success=$((success + 1))
+            successful_files+=("$file")
+            successful_keys+=("$expected_key")
+        else
+            failed=$((failed + 1))
+        fi
+    done
+
+    printf '\n%sИтог массового отзыва:%s\n' "$C_BOLD" "$C_RESET"
+    print_field "Успешно отозвано" "$success"
+    print_field "Ошибок" "$failed"
+    print_field "Пропущено" "$skipped"
+    (( changed > 0 )) && print_field "Изменились после проверки" "$changed"
+
+    if (( allow_queue_cleanup == 1 && success > 0 )); then
+        if [[ "${YES:-0}" -eq 1 || ! -t 0 ]]; then
+            info "Успешно обработанные файлы оставлены в revoke/. --yes никогда не удаляет файлы."
+        else
+            printf '\n'
+            print_danger_item "1" "Удалить успешно отозванные файлы из revoke/ (${success})"
+            print_menu_item "0" "Оставить файлы"
+            local cleanup_choice
+            while true; do
+                read_menu_choice cleanup_choice
+                case "$cleanup_choice" in
+                    1)
+                        remove_batch_queue_files successful_files successful_keys
+                        break
+                        ;;
+                    0)
+                        info "Файлы оставлены в revoke/."
+                        break
+                        ;;
+                    *) warn "Выберите 1 или 0." ;;
+                esac
+            done
+        fi
+    fi
+
+    (( failed == 0 && unknown == 0 && invalid == 0 && conflict == 0 ))
+}
+
+revoke_menu_ui() {
+    [[ -t 0 ]] || {
+        error "Интерактивное меню отзыва требует терминал."
+        return 1
+    }
+
+    ensure_dependencies list || return 1
+    init_registry || return 1
+
+    while true; do
+        clear_ui
+        print_title "WARP Amnezia Manager › Регистрации › Отзыв"
+        printf '\n'
+        print_field "Файлов в revoke/" "$(queue_config_count)"
+        print_divider
+        printf '\n'
+        print_menu_item "1" "Отозвать по номеру регистрации"
+        print_menu_item "2" "Отозвать один конфиг из revoke/"
+        print_menu_item "3" "Отозвать конфиг по указанному пути"
+        print_menu_item "4" "Отозвать все подходящие конфиги из revoke/"
+        print_menu_item "0" "Назад"
+
+        local choice
+        read_menu_choice choice
+        case "$choice" in
+            1)
+                clear_ui
+                print_title "Отзыв › По номеру регистрации"
+                printf '\n'
+                interactive_revoke_by_index || true
+                pause_ui
+                ;;
+            2)
+                clear_ui
+                print_title "Отзыв › Один конфиг из revoke/"
+                printf '\n'
+                interactive_revoke_queue_file || true
+                pause_ui
+                ;;
+            3)
+                clear_ui
+                print_title "Отзыв › Файл по указанному пути"
+                printf '\n'
+                interactive_revoke_path || true
+                pause_ui
+                ;;
+            4)
+                clear_ui
+                print_title "Отзыв › Все конфиги из revoke/"
+                revoke_directory "$REVOKE_DIR" 1 || true
+                pause_ui
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                warn "Выберите пункт 0–4."
+                pause_ui
+                ;;
+        esac
+    done
+}
+
+interactive_revoke() {
+    revoke_menu_ui
+}
+
+revoke_target() {
+    local target="$1"
+
+    if [[ "$target" =~ ^[1-9][0-9]*$ ]]; then
+        ensure_dependencies manage || return 1
+        init_registry || return 1
+        local registration
+        registration="$(get_registration_by_index "$target")"
+        [[ -n "$registration" ]] || {
+            error "Регистрации с номером ${target} нет."
+            return 1
+        }
+        revoke_registration_record "$registration" manual 1
+        return
+    fi
+
+    revoke_config_file "$target" 0
 }
 
 revoke_by_id() {
@@ -2025,9 +2793,9 @@ show_technical_info() {
 
     printf '\n'
     print_field "Registration ID" "$id"
-    print_field "Публичный ключ" "$(mask_value "$public_key")"
-    print_field "Token" "$(mask_value "$token")"
-    print_field "Конфиг" "${config:-—}"
+    print_field "Client public key" "$(mask_optional_value "$public_key")"
+    print_field "Token" "$(mask_optional_value "$token")"
+    print_field "Первоначальный путь" "${config:-—}"
     print_field "Создан" "$(format_date_local "$created")"
     print_field "Истекает" "$(format_date_local "$expires")"
     print_field "Отозван" "$(format_date_local "$revoked")"
@@ -2234,9 +3002,9 @@ registration_details_ui() {
         registration="$(get_registration_by_index "$index")"
         [[ -n "$registration" ]] || return 0
 
-        local name config created expires status raw_label
-        name="$(display_name_for_registration "$registration")"
+        local config created expires status raw_label public_key
         raw_label="$(jq -r '.label // empty' <<< "$registration")"
+        public_key="$(jq -r '.public_key // empty' <<< "$registration")"
         config="$(jq -r '.config // empty' <<< "$registration")"
         created="$(jq -r '.created_at // empty' <<< "$registration")"
         expires="$(jq -r '.expires_at // empty' <<< "$registration")"
@@ -2246,7 +3014,8 @@ registration_details_ui() {
         print_title "Регистрация #${index}"
         printf '\n'
         print_field "Метка" "${raw_label:-—}"
-        print_field "Конфиг" "${config:-—}"
+        print_field "Public key" "$(mask_optional_value "$public_key")"
+        print_field "Первоначальный путь" "${config:-—}"
         print_field "Создан" "$(format_date_local "$created")"
         print_field "Истекает" "$(format_date_local "$expires")"
         print_field_prefix "Статус"
@@ -2255,12 +3024,12 @@ registration_details_ui() {
 
         if [[ -n "$config" ]]; then
             if [[ -e "${SCRIPT_DIR}/${config}" ]]; then
-                print_field "Файл" "существует"
+                print_field "Исходный файл" "существует"
             else
-                print_field "Файл" "удалён или перемещён"
+                print_field "Исходный файл" "удалён или перемещён"
             fi
         else
-            print_field "Файл" "не был создан / не привязан"
+            print_field "Исходный файл" "не был создан / не привязан"
         fi
 
         print_divider
@@ -2271,7 +3040,7 @@ registration_details_ui() {
             print_menu_item "2" "Изменить срок действия"
             print_menu_item "3" "Продлить срок"
             print_menu_item "4" "Сделать бессрочным"
-            print_danger_item "5" "Отозвать регистрацию"
+            print_menu_item "5" "Отозвать регистрацию"
             print_menu_item "6" "Техническая информация"
         else
             print_menu_item "2" "Техническая информация"
@@ -2396,11 +3165,7 @@ registrations_menu() {
                 bulk_update_labels_ui
                 ;;
             3)
-                clear_ui
-                print_title "Регистрации › Отзыв"
-                printf '\n'
-                interactive_revoke || true
-                pause_ui
+                revoke_menu_ui
                 ;;
             4)
                 expiry_check_ui
@@ -2537,6 +3302,7 @@ LABEL=""
 TTL=""
 EXPIRES_INPUT=""
 REVOKE_TARGET=""
+REVOKE_DIR_TARGET=""
 REVOKE_ID=""
 POSITIONAL=()
 GENERATION_OPTION_SEEN=0
@@ -2620,6 +3386,34 @@ while [[ $# -gt 0 ]]; do
                 shift
             fi
             ;;
+        --revoke=*)
+            set_mode "revoke"
+            REVOKE_TARGET="${1#*=}"
+            [[ -n "$REVOKE_TARGET" ]] || {
+                error "Опции --revoke= требуется непустая цель."
+                exit 2
+            }
+            shift
+            ;;
+        --revoke-dir)
+            set_mode "revoke-dir"
+            if [[ $# -ge 2 && "$2" != -* ]]; then
+                REVOKE_DIR_TARGET="$2"
+                shift 2
+            else
+                REVOKE_DIR_TARGET="$REVOKE_DIR"
+                shift
+            fi
+            ;;
+        --revoke-dir=*)
+            set_mode "revoke-dir"
+            REVOKE_DIR_TARGET="${1#*=}"
+            [[ -n "$REVOKE_DIR_TARGET" ]] || {
+                error "Опции --revoke-dir требуется непустой путь."
+                exit 2
+            }
+            shift
+            ;;
         --revoke-id)
             [[ $# -ge 2 ]] || {
                 error "Опции --revoke-id требуется registration ID."
@@ -2696,8 +3490,14 @@ if (( DRY_RUN == 1 )) && [[ "$MODE" != "revoke-expired" ]]; then
     exit 2
 fi
 
-if (( YES == 1 )) && [[ "$MODE" != "revoke" && "$MODE" != "revoke-id" ]]; then
-    error "--yes используется только с ручным отзывом (--revoke/--revoke-id)."
+if (( YES == 1 )) && [[ "$MODE" != "revoke" && "$MODE" != "revoke-id" && "$MODE" != "revoke-dir" ]]; then
+    error "--yes используется только с --revoke, --revoke-dir или --revoke-id."
+    exit 2
+fi
+
+if (( YES == 1 )) && [[ "$MODE" == "revoke" && -z "$REVOKE_TARGET" ]]; then
+    error "--revoke --yes без конкретного номера или файла запрещён."
+    error "Укажите цель отзыва либо откройте интерактивное меню без --yes."
     exit 2
 fi
 
@@ -2754,12 +3554,18 @@ case "$MODE" in
         print_registration_list
         ;;
     revoke)
-        ensure_dependencies manage
-        init_registry
         if [[ -z "$REVOKE_TARGET" ]]; then
             interactive_revoke
         else
             revoke_target "$REVOKE_TARGET"
+        fi
+        ;;
+    revoke-dir)
+        [[ -n "$REVOKE_DIR_TARGET" ]] || REVOKE_DIR_TARGET="$REVOKE_DIR"
+        if [[ "$(normalize_input_path "$REVOKE_DIR_TARGET")" == "$REVOKE_DIR" ]]; then
+            revoke_directory "$REVOKE_DIR_TARGET" 1
+        else
+            revoke_directory "$REVOKE_DIR_TARGET" 0
         fi
         ;;
     revoke-id)
